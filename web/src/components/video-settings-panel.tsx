@@ -19,6 +19,15 @@ const videoModeOptions = [
     { value: "reference", labelKey: "reference" },
 ];
 
+const sizeOptions = [
+    { value: "1280x720", labelKey: "landscape", width: 1280, height: 720 },
+    { value: "720x1280", labelKey: "portrait", width: 720, height: 1280 },
+    { value: "1024x1024", labelKey: "square", width: 1024, height: 1024 },
+    { value: "1792x1024", labelKey: "widescreen", width: 1792, height: 1024 },
+    { value: "1024x1792", labelKey: "tall", width: 1024, height: 1792 },
+    { value: "auto", labelKey: "auto", width: 0, height: 0 },
+];
+
 const secondOptions = [6, 10, 12, 16, 20];
 const seedanceRatioLabelKeys: Record<string, string> = { "16:9": "landscape", "9:16": "portrait", "1:1": "square", "4:3": "standardLandscape", "3:4": "standardPortrait", "21:9": "cinematic", adaptive: "adaptive" };
 
@@ -280,6 +289,10 @@ function DimensionInput({ prefix, value, disabled, theme, onChange }: { prefix: 
             <input type="number" min={1} disabled={disabled} className="min-w-0 flex-1 bg-transparent px-2 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" value={value || ""} onChange={(event) => onChange(Number(event.target.value) || null)} onMouseDown={(event) => event.stopPropagation()} />
         </label>
     );
+}
+
+function NumberInput({ value, min, max, theme, onChange }: { value: string; min: number; max: number; theme: CanvasTheme; onChange: (value: string) => void }) {
+    return <input type="number" min={min} max={max} className="h-9 rounded-full border bg-transparent px-3 text-center text-sm outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" style={{ borderColor: theme.node.stroke, color: theme.node.text, WebkitTextFillColor: theme.node.text }} value={value} onChange={(event) => onChange(event.target.value)} onMouseDown={(event) => event.stopPropagation()} />;
 }
 
 function SizePreview({ width, height, color }: { width: number; height: number; color: string }) {
