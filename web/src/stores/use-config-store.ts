@@ -5,7 +5,7 @@ import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
 
-export type ApiCallFormat = "openai" | "gemini";
+export type ApiCallFormat = "openai" | "gemini" | "ark";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
@@ -76,6 +76,7 @@ const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
 export const LOCAL_PROXY_PACKAGE = "@basketikun/canvas-proxy";
 export const DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:23210";
+const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 
 export const defaultConfig: AiConfig = {
     channelMode: "local",
@@ -146,11 +147,7 @@ type ConfigStore = {
     clearPromptContinue: () => void;
 };
 
-const VIDEO_KEYWORDS = ["video", "sora", "veo", "kling", "wan", "hailuo"];
-
-export function boolConfig(value: string, fallback: boolean) {
-    return value ? value === "true" : fallback;
-}
+const VIDEO_KEYWORDS = ["seedance", "video", "sora", "veo", "kling", "wan", "hailuo"];
 const AUDIO_KEYWORDS = ["audio", "tts", "speech", "voice", "music", "sound"];
 const IMAGE_KEYWORDS = ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "flux", "sdxl", "stable-diffusion", "midjourney"];
 
@@ -462,11 +459,12 @@ function normalizeChannels(config: AiConfig) {
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
+    if (apiFormat === "ark") return ARK_BASE_URL;
     return OPENAI_BASE_URL;
 }
 
 function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    return apiFormat === "gemini" ? apiFormat : "openai";
+    return apiFormat === "gemini" || apiFormat === "ark" ? apiFormat : "openai";
 }
 
 function uniqueModelOptions(models: string[]) {
@@ -474,9 +472,10 @@ function uniqueModelOptions(models: string[]) {
 }
 
 export function buildApiUrl(baseUrl: string, path: string) {
-    const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+    let normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+    normalizedBaseUrl = normalizeArkPlanBaseUrl(normalizedBaseUrl);
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
+    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/api/v3") || lowerBaseUrl.endsWith("/api/plan/v3") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
     return withLocalProxy(`${apiBaseUrl}${path}`);
 }
 
@@ -493,4 +492,22 @@ export function withLocalProxy(url: string) {
     const base = normalizeLocalProxyUrl(proxyUrl);
     if (!base || url.startsWith(`${base}/`)) return url;
     return `${base}/${url}`;
+}
+
+function normalizeArkPlanBaseUrl(baseUrl: string) {
+    try {
+        const url = new URL(baseUrl);
+        const path = url.pathname.replace(/\/+$/, "");
+        const lowerPath = path.toLowerCase();
+        const arkPlanIndex = lowerPath.indexOf("/api/plan/v3");
+        if (arkPlanIndex < 0) return baseUrl;
+        const end = arkPlanIndex + "/api/plan/v3".length;
+        if (lowerPath.length !== end && lowerPath[end] !== "/") return baseUrl;
+        url.pathname = path.slice(0, end);
+        url.search = "";
+        url.hash = "";
+        return url.toString().replace(/\/+$/, "");
+    } catch {
+        return baseUrl;
+    }
 }

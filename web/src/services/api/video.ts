@@ -4,6 +4,7 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
+import { buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
@@ -13,13 +14,22 @@ import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
 type VideoResponse = { id: string; status?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null };
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
+type SeedanceTask = {
+    id: string;
+    status?: "queued" | "running" | "succeeded" | "completed" | "failed" | "cancelled" | "expired";
+    error?: { code?: string; message?: string } | null;
+    content?: { video_url?: string; url?: string; last_frame_url?: string } | null;
+    url?: string;
+    result_url?: string;
+    video_url?: string;
+};
 type ApiEnvelope<T> = T | { code?: number | string; data?: T | null; msg?: string; message?: string; error?: { message?: string } };
 type RequestOptions = { signal?: AbortSignal };
 type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: ReferenceAudio[] };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "seedance" | "plugin"; model: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -48,13 +58,14 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
 }
 
 export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
+    const delayMs = task.provider === "seedance" ? 5000 : 2500;
     for (let attempt = 0; attempt < 120; attempt += 1) {
         if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const state = await pollVideoGenerationTask(config, task, options);
         if (state.status === "completed") return state.result;
         if (state.status === "failed") throw videoTaskFailed(state.error);
-        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
-        await delay(2500, options?.signal);
+        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: task.provider === "seedance" ? "Seedance " : "" }));
+        await delay(delayMs, options?.signal);
     }
     throw new Error(apiText("videoTimeout", { provider: "" }));
 }
@@ -76,6 +87,9 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
+    if (isSeedanceVideoConfig(requestConfig)) {
+        return createSeedanceTask(requestConfig, selectedModel, prompt, references, options?.videos || [], options?.audios || [], options);
+    }
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
 }
 
@@ -87,6 +101,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
+    if (task.provider === "seedance") return pollSeedanceTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
 
@@ -192,6 +207,114 @@ async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, 
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
     }
+}
+
+async function createSeedanceTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], videoReferences: ReferenceVideo[], audioReferences: ReferenceAudio[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    if (audioReferences.length && !references.length && !videoReferences.length) {
+        throw new Error(apiText("seedanceAudioRequiresVisual"));
+    }
+    assertSeedanceVideoReferences(videoReferences);
+    assertSeedanceAudioReferences(audioReferences);
+    const content = await buildSeedanceContent(config, prompt, references, videoReferences, audioReferences);
+    if (!content.length) throw new Error(apiText("videoPromptRequired"));
+    const payload = {
+        model: modelOptionName(model),
+        content,
+        ratio: normalizeSeedanceRatio(config.size),
+        resolution: normalizeSeedanceResolution(config.vquality),
+        duration: normalizeSeedanceDuration(config.videoSeconds),
+        generate_audio: boolConfig(config.videoGenerateAudio, true),
+        watermark: boolConfig(config.videoWatermark, false),
+    };
+
+    try {
+        const created = unwrapSeedanceTask((await axios.post<ApiEnvelope<SeedanceTask>>(seedanceApiUrl(config), payload, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data);
+        if (!created.id) throw new Error(apiText("seedanceNoTaskId"));
+        return { id: created.id, provider: "seedance", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("seedanceTaskCreateFailed")));
+    }
+}
+
+async function pollSeedanceTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const state = unwrapSeedanceTask((await axios.get<ApiEnvelope<SeedanceTask>>(seedanceApiUrl(config, task.id), { headers: aiHeaders(config), signal: options?.signal })).data);
+        const url = videoResultUrl(state);
+        if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+        if (state.status === "succeeded" || state.status === "completed") return { status: "failed", error: apiText("seedanceNoVideoUrl") };
+        if (state.status === "failed" || state.status === "cancelled" || state.status === "expired") return { status: "failed", error: readApiErrorMessage(state.error?.message) || apiText(state.status === "expired" ? "seedanceVideoTimeout" : "seedanceVideoFailed") };
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("seedanceTaskQueryFailed")));
+    }
+}
+
+function assertSeedanceVideoReferences(videoReferences: ReferenceVideo[]) {
+    const error = seedanceVideoReferenceError(videoReferences);
+    if (error) throw new Error(error);
+    let total = 0;
+    for (const video of videoReferences) {
+        if (!video.durationMs) continue;
+        if (video.durationMs < 2000 || video.durationMs > 15000) throw new Error(apiText("seedanceVideoDuration"));
+        total += video.durationMs;
+    }
+    if (total > 15000) throw new Error(apiText("seedanceVideoTotalDuration"));
+}
+
+function assertSeedanceAudioReferences(audioReferences: ReferenceAudio[]) {
+    let total = 0;
+    for (const audio of audioReferences) {
+        if (!audio.durationMs) continue;
+        if (audio.durationMs < 2000 || audio.durationMs > 15000) throw new Error(apiText("seedanceAudioDuration"));
+        total += audio.durationMs;
+    }
+    if (total > 15000) throw new Error(apiText("seedanceAudioTotalDuration"));
+}
+
+function seedanceApiUrl(config: AiConfig, taskId?: string) {
+    return buildApiUrl(config.baseUrl, `/contents/generations/tasks${taskId ? `/${encodeURIComponent(taskId)}` : ""}`);
+}
+
+async function buildSeedanceContent(config: AiConfig, prompt: string, references: ReferenceImage[], videoReferences: ReferenceVideo[], audioReferences: ReferenceAudio[]) {
+    const content: Array<Record<string, unknown>> = [];
+    const text = buildSeedancePromptText(prompt, references, videoReferences, audioReferences);
+    if (text) content.push({ type: "text", text });
+    for (const image of references.slice(0, SEEDANCE_REFERENCE_LIMITS.images)) {
+        content.push({ type: "image_url", image_url: { url: await resolveSeedanceImageUrl(config, image) }, role: "reference_image" });
+    }
+    for (const video of videoReferences.slice(0, SEEDANCE_REFERENCE_LIMITS.videos)) {
+        content.push({ type: "video_url", video_url: { url: await resolveSeedanceVideoUrl(video) }, role: "reference_video" });
+    }
+    for (const audio of audioReferences.slice(0, SEEDANCE_REFERENCE_LIMITS.audios)) {
+        content.push({ type: "audio_url", audio_url: { url: await resolveSeedanceAudioUrl(audio) }, role: "reference_audio" });
+    }
+    return content;
+}
+
+async function resolveSeedanceImageUrl(config: AiConfig, image: ReferenceImage) {
+    const directUrl = image.url || image.dataUrl;
+    if (isPublicMediaUrl(directUrl) || directUrl.startsWith("asset://")) return directUrl;
+    const dataUrl = await imageToDataUrl(image);
+    if (!dataUrl) throw new Error(apiText("referenceImageReadFailed"));
+    return dataUrl;
+}
+
+async function resolveSeedanceVideoUrl(video: ReferenceVideo) {
+    if (isPublicMediaUrl(video.url) || video.url.startsWith("asset://")) return video.url;
+    let blob: Blob | null = null;
+    if (video.storageKey) blob = await getMediaBlob(video.storageKey);
+    if (!blob && video.url?.startsWith("blob:")) blob = await (await fetch(video.url)).blob();
+    if (!blob) throw new Error(apiText("invalidReferenceVideo"));
+    return blobToDataUrl(blob);
+}
+
+async function resolveSeedanceAudioUrl(audio: ReferenceAudio) {
+    if (isPublicMediaUrl(audio.url) || audio.url.startsWith("asset://")) return audio.url;
+    let blob: Blob | null = null;
+    if (audio.storageKey) blob = await getMediaBlob(audio.storageKey);
+    if (!blob && audio.url?.startsWith("blob:")) blob = await (await fetch(audio.url)).blob();
+    if (!blob) throw new Error(apiText("invalidReferenceAudio"));
+    return blobToDataUrl(blob);
 }
 
 async function videoResultFromUrl(url: string, options?: RequestOptions): Promise<VideoGenerationResult> {
@@ -333,6 +456,10 @@ function unwrapVideoResponse(payload: ApiVideoResponse) {
     return unwrapEnvelope(payload, apiText("noVideoTask"));
 }
 
+function unwrapSeedanceTask(payload: ApiEnvelope<SeedanceTask>) {
+    return unwrapEnvelope(payload, apiText("seedanceNoTask"));
+}
+
 function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
     if (!payload) throw new Error(emptyMessage);
     if (typeof payload === "object" && "code" in payload && payload.code !== undefined) {
@@ -343,7 +470,7 @@ function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
     return payload as T;
 }
 
-function videoResultUrl(payload: VideoResponse) {
+function videoResultUrl(payload: VideoResponse | SeedanceTask) {
     return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
 }
 
@@ -424,5 +551,14 @@ function delay(ms: number, signal?: AbortSignal) {
             },
             { once: true },
         );
+    });
+}
+
+function blobToDataUrl(blob: Blob) {
+    return new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error(apiText("localAssetReadFailed")));
+        reader.readAsDataURL(blob);
     });
 }
