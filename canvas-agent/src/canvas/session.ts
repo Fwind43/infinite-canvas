@@ -453,6 +453,7 @@ export class CanvasSession {
             return { nodes: (this.canvasState?.nodes || []).filter((node) => ids.has(node.id)).map(compactNode) };
         }
         if (name === "canvas_create_attachment_nodes") return await this.createAttachmentNodes(input as { attachmentIds: string[]; x?: number; y?: number; gap?: number; direction?: "row" | "column" });
+        if (name === "canvas_upload_local_media") return await this.uploadLocalMediaNodes(input);
         if (!this.clients.size) throw new Error("当前没有已连接画布");
         const request = buildCanvasToolRequest(name, input, this.canvasState);
         return await this.requestCanvasTool(request.name, request.input);
@@ -483,6 +484,39 @@ export class CanvasSession {
         });
         await this.requestCanvasTool("canvas_create_attachment_nodes", { nodes });
         return { nodes: nodes.map(({ id, attachmentId, title }) => ({ id, attachmentId, title })) };
+    }
+
+    /** 将本机路径的图片/视频/音频文件上传到画布 IndexedDB 并创建或更新节点。 */
+    private async uploadLocalMediaNodes(input: Record<string, unknown>) {
+        const clientId = this.targetClientId;
+        if (!this.clients.has(clientId)) throw new Error("当前没有已连接画布");
+        const rawItems = Array.isArray(input.items) && input.items.length
+            ? input.items
+            : typeof input.path === "string" && input.path.trim()
+              ? [input]
+              : [];
+        if (!rawItems.length) throw new Error("请提供本机媒体文件绝对路径 path 或 items");
+        const x = Number(input.x ?? nextCanvasX(this.canvasState));
+        const y = Number(input.y ?? 0);
+        const gap = Number(input.gap ?? 40);
+        const direction = input.direction === "column" ? "column" : "row";
+        const items = rawItems.map((raw, index) => {
+            const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+            const filePath = String(item.path || "").trim();
+            if (!filePath) throw new Error(`第 ${index + 1} 项缺少媒体文件绝对路径 path`);
+            return {
+                id: typeof item.id === "string" && item.id.trim() ? item.id.trim() : undefined,
+                path: filePath,
+                nodeType: typeof item.nodeType === "string" ? item.nodeType : undefined,
+                title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : undefined,
+                x: typeof item.x === "number" ? item.x : undefined,
+                y: typeof item.y === "number" ? item.y : undefined,
+                width: typeof item.width === "number" ? item.width : undefined,
+                height: typeof item.height === "number" ? item.height : undefined,
+                metadata: item.metadata && typeof item.metadata === "object" ? item.metadata : undefined,
+            };
+        });
+        return await this.requestCanvasTool("canvas_upload_local_media", { items, x, y, gap, direction });
     }
 
     /** 向目标网页发送工具请求并等待调用结果。 */

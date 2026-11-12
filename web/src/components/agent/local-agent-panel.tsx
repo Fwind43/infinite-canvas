@@ -9,11 +9,12 @@ import i18n from "@/i18n";
 import { readAgentUrlBootstrap } from "@/lib/agent/agent-url-bootstrap";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
-import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
+import { audioMetadata, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
 import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
 import { resolveCanvasReferenceImages } from "@/lib/canvas/canvas-resource-references";
 import { readImageMeta } from "@/lib/image-utils";
 import { randomId } from "@/lib/utils";
+import { uploadMediaFile } from "@/services/file-storage";
 import { uploadImage } from "@/services/image-storage";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useAgentSkillStore } from "@/stores/use-agent-skill-store";
@@ -837,6 +838,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 appliedOps = await attachmentNodeOps(endpoint, token, clientIdRef.current, payload.input?.nodes);
                 result = context.applyOps(appliedOps);
                 await postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
+            } else if (payload.name === "canvas_upload_local_media") {
+                const context = canvasContextRef.current;
+                if (!context) throw new Error(rt("openCanvasFirst"));
+                appliedOps = await localMediaNodeOps(endpoint, token, payload.input, context.snapshot);
+                result = context.applyOps(appliedOps);
+                await postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
             } else {
                 const snapshot = canvasContextRef.current?.snapshot;
                 if (!snapshot) throw new Error(rt("openCanvasFirst"));
@@ -1545,6 +1552,113 @@ async function attachmentNodeOps(endpoint: string, token: string, clientId: stri
             };
         }),
     );
+}
+
+async function localMediaNodeOps(endpoint: string, token: string, rawInput: unknown, snapshot: CanvasAgentSnapshot): Promise<CanvasAgentOp[]> {
+    const input = (rawInput && typeof rawInput === "object" ? rawInput : {}) as {
+        items?: unknown[];
+        x?: number;
+        y?: number;
+        gap?: number;
+        direction?: string;
+    };
+    const items = Array.isArray(input.items) ? input.items : [];
+    if (!items.length) throw new Error("未提供需要上传的本地媒体文件");
+    let cursorX = Number(input.x) || 0;
+    let cursorY = Number(input.y) || 0;
+    const gap = Number(input.gap ?? 40);
+    const direction = input.direction === "column" ? "column" : "row";
+    const ops: CanvasAgentOp[] = [];
+    for (const rawItem of items) {
+        const item = (rawItem && typeof rawItem === "object" ? rawItem : {}) as {
+            id?: string;
+            path?: string;
+            nodeType?: "image" | "video" | "audio";
+            title?: string;
+            x?: number;
+            y?: number;
+            width?: number;
+            height?: number;
+            metadata?: Record<string, unknown>;
+        };
+        const filePath = String(item.path || "").trim();
+        if (!filePath) throw new Error("本地媒体文件路径不能为空");
+        const res = await fetch(`${endpoint}/agent/local-media?token=${encodeURIComponent(token)}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ path: filePath }),
+        });
+        if (!res.ok) {
+            const body = (await res.json().catch(() => null)) as { error?: string } | null;
+            throw new Error(body?.error || `读取本地媒体文件失败: ${filePath}`);
+        }
+        const blob = await res.blob();
+        const nodeType: "image" | "video" | "audio" =
+            item.nodeType === "image" || item.nodeType === "video" || item.nodeType === "audio"
+                ? item.nodeType
+                : blob.type.startsWith("video/") || /\.(?:mp4|webm|mov)$/i.test(filePath)
+                  ? "video"
+                  : blob.type.startsWith("audio/") || /\.(?:mp3|wav|m4a|ogg|aac|flac)$/i.test(filePath)
+                    ? "audio"
+                    : "image";
+        const defaultTitle = filePath.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || nodeType;
+        const extraMeta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+        let size = { width: 320, height: 240 };
+        let metadata: Record<string, unknown>;
+        if (nodeType === "image") {
+            const uploaded = await uploadImage(blob);
+            size = fitNodeSize(uploaded.width, uploaded.height);
+            metadata = { ...imageMetadata(uploaded), ...extraMeta };
+        } else if (nodeType === "video") {
+            const uploaded = await uploadMediaFile(blob, "video");
+            size = fitNodeSize(uploaded.width || 420, uploaded.height || 260);
+            metadata = { ...videoMetadata(uploaded), ...extraMeta };
+        } else {
+            const uploaded = await uploadMediaFile(blob, "audio");
+            size = { width: 320, height: 180 };
+            metadata = { ...audioMetadata(uploaded), ...extraMeta };
+        }
+        const existing = item.id ? snapshot.nodes.find((n) => n.id === item.id) : undefined;
+        if (existing) {
+            ops.push({
+                type: "update_node",
+                id: existing.id,
+                patch: {
+                    ...(item.title ? { title: String(item.title) } : {}),
+                    width: typeof item.width === "number" ? item.width : size.width,
+                    height: typeof item.height === "number" ? item.height : size.height,
+                    ...(typeof item.x === "number" || typeof item.y === "number"
+                        ? {
+                              position: {
+                                  x: typeof item.x === "number" ? item.x : existing.position.x,
+                                  y: typeof item.y === "number" ? item.y : existing.position.y,
+                              },
+                          }
+                        : {}),
+                },
+                metadata,
+            });
+        } else {
+            const id = String(item.id || `${nodeType}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
+            const width = typeof item.width === "number" ? item.width : size.width;
+            const height = typeof item.height === "number" ? item.height : size.height;
+            const posX = typeof item.x === "number" ? item.x : cursorX;
+            const posY = typeof item.y === "number" ? item.y : cursorY;
+            if (direction === "row" && typeof item.x !== "number") cursorX += width + gap;
+            if (direction === "column" && typeof item.y !== "number") cursorY += height + gap;
+            ops.push({
+                type: "add_node",
+                id,
+                nodeType,
+                title: String(item.title || defaultTitle),
+                position: { x: posX, y: posY },
+                width,
+                height,
+                metadata,
+            });
+        }
+    }
+    return ops;
 }
 
 function createId() {

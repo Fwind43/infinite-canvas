@@ -48,13 +48,28 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
 }
 
 export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
+    let consecutivePollErrors = 0;
     for (let attempt = 0; attempt < 120; attempt += 1) {
         if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        const state = await pollVideoGenerationTask(config, task, options);
+        let state: VideoGenerationTaskState;
+        try {
+            state = await pollVideoGenerationTask(config, task, options);
+            consecutivePollErrors = 0;
+        } catch (error) {
+            if (options?.signal?.aborted || (error instanceof DOMException && error.name === "AbortError") || isVideoTaskFailed(error)) {
+                throw error;
+            }
+            consecutivePollErrors += 1;
+            if (consecutivePollErrors >= 3 || attempt === 119) throw error;
+            const retryWaitMs = Math.min(10000, Math.round(2500 * Math.pow(1.3, consecutivePollErrors) + Math.random() * 600));
+            await delay(retryWaitMs, options?.signal);
+            continue;
+        }
         if (state.status === "completed") return state.result;
         if (state.status === "failed") throw videoTaskFailed(state.error);
         if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
-        await delay(2500, options?.signal);
+        const pollWaitMs = Math.min(10000, Math.round(2500 * Math.pow(1.12, Math.min(attempt, 12)) + Math.random() * 500));
+        await delay(pollWaitMs, options?.signal);
     }
     throw new Error(apiText("videoTimeout", { provider: "" }));
 }
@@ -112,7 +127,7 @@ async function createPluginVideoTask(config: AiConfig, model: string, script: st
                 ratio: videoAspectRatio(config.size),
                 generateAudio: boolConfig(config.videoGenerateAudio, true),
                 watermark: boolConfig(config.videoWatermark, false),
-                mode: resolveVideoMode(config.videoMode, refs.length),
+                mode: resolveVideoMode(config.videoMode, refs.length, videos.length > 0 || audios.length > 0),
             },
             signal: options?.signal,
         }),
@@ -150,7 +165,7 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
     const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
-    const mode = resolveVideoMode(config.videoMode, images.length);
+    const mode = resolveVideoMode(config.videoMode, images.length, videos.length > 0 || audios.length > 0);
     const ratio = inferVideoRatio(config.size || "16:9");
     const body = new FormData();
     body.append("model", modelOptionName(model));
@@ -222,7 +237,7 @@ async function createGeminiVideoTask(config: AiConfig, model: string, prompt: st
     const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
     const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
-    const mode = resolveVideoMode(config.videoMode, images.length);
+    const mode = resolveVideoMode(config.videoMode, images.length, videos.length > 0 || audios.length > 0);
     const instance: Record<string, unknown> = { prompt };
     if (mode === "frames") {
         if (images[0]) instance.image = parseDataUrlInline(images[0]);
@@ -303,6 +318,9 @@ async function fileToGeminiInline(file: File): Promise<GeminiInlineData> {
 }
 
 async function referenceMediaToFile(item: { name: string; type?: string; url?: string; storageKey?: string }, fallbackName: string, errorKey: "invalidReferenceVideo" | "invalidReferenceAudio", options?: RequestOptions) {
+    if (item.url?.startsWith("data:")) {
+        return dataUrlToFile({ id: item.name || fallbackName, name: item.name || fallbackName, type: item.type || "application/octet-stream", dataUrl: item.url });
+    }
     let blob = item.storageKey ? await getMediaBlob(item.storageKey) : null;
     if (!blob) {
         const url = item.storageKey ? await resolveMediaUrl(item.storageKey, item.url || "") : item.url || "";
@@ -322,8 +340,8 @@ function normalizeVideoSeconds(value: string) {
     return clampVideoSeconds(value);
 }
 
-function resolveVideoMode(mode: string | undefined, imageCount: number) {
-    if (mode === "reference" || imageCount > 2) return "reference";
+function resolveVideoMode(mode: string | undefined, imageCount: number, hasMediaReferences = false) {
+    if (mode === "reference" || imageCount > 2 || hasMediaReferences) return "reference";
     return "frames";
 }
 

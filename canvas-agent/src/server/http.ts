@@ -169,6 +169,14 @@ export function startHttpServer() {
         res.setHeader("Cache-Control", "no-store");
         res.type(path.extname(filePath)).send(await readFile(filePath));
     }));
+    app.post("/agent/local-media", route(async (req, res) => {
+        const filePath = String(req.body?.path || "");
+        if (!path.isAbsolute(filePath) || !/\.(?:avif|gif|jpe?g|png|webp|mp4|webm|mov|mp3|wav|m4a|ogg|aac|flac)$/i.test(filePath)) return res.status(400).json({ ok: false, error: "媒体文件路径无效" });
+        const file = await stat(filePath);
+        if (!file.isFile()) return res.status(400).json({ ok: false, error: "媒体文件无效" });
+        res.setHeader("Cache-Control", "no-store");
+        res.type(path.extname(filePath)).send(await readFile(filePath));
+    }));
     app.post("/api/tools", route(async (req, res) => res.json({ ok: true, result: await session.callTool(req.body?.name, req.body?.input || {}) })));
     app.get("/agent/codex/workspace", (_req, res) => {
         const workspace = ensureSiteWorkspace(config);

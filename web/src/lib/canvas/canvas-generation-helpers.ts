@@ -48,19 +48,19 @@ export async function hydrateCanvasImages(nodes: CanvasNodeData[]) {
             const metadata = node.metadata;
             const content = metadata?.content;
             if ((node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) && metadata?.storageKey) return { ...node, metadata: { ...metadata, content: await resolveMediaUrl(metadata.storageKey, content) } };
-            if (node.type !== CanvasNodeType.Image || !metadata || !content) return node;
+            if (node.type !== CanvasNodeType.Image || !metadata || (!content && !metadata.storageKey)) return node;
             const images = await Promise.all(
                 (metadata.images || []).map(async (image) => {
-                    if (!image.content) return image;
+                    if (!image.content && !image.storageKey) return image;
                     void ensureImagePreview(image.storageKey);
-                    return { ...image, content: await resolveImageUrl(image.storageKey, image.content) };
+                    return { ...image, content: await resolveImageUrl(image.storageKey, image.content || "") };
                 }),
             );
             if (metadata.storageKey) {
                 void ensureImagePreview(metadata.storageKey);
-                return { ...node, metadata: { ...metadata, content: await resolveImageUrl(metadata.storageKey, content), images } };
+                return { ...node, metadata: { ...metadata, content: await resolveImageUrl(metadata.storageKey, content || ""), images } };
             }
-            if (!content.startsWith("data:image/")) return node;
+            if (!content || !content.startsWith("data:image/")) return node;
             return { ...node, metadata: { ...metadata, ...imageMetadata(await uploadImage(content)) } };
         }),
     );
@@ -165,16 +165,80 @@ export function findRetrySourceNode(nodeId: string, nodes: CanvasNodeData[], con
 }
 
 export function sourceNodeReferenceImages(node: CanvasNodeData | null) {
-    if (!node || node.type !== CanvasNodeType.Image || !node.metadata?.content) return [];
+    if (!node || node.type !== CanvasNodeType.Image || (!node.metadata?.content && !node.metadata?.storageKey)) return [];
     return [
         {
             id: node.id,
             name: `${node.title || node.id}.png`,
             type: node.metadata.mimeType || "image/png",
-            dataUrl: node.metadata.content,
+            dataUrl: node.metadata.content || "",
             storageKey: node.metadata.storageKey,
         },
     ];
+}
+
+export function validateNodeGenerationPreFlight(params: {
+    mode: CanvasNodeGenerationMode;
+    requestConfig: AiConfig;
+    sourceNodeId: string;
+    nodes: CanvasNodeData[];
+    connections: CanvasConnection[];
+    referenceImages: ReferenceImage[];
+    referenceVideos: Array<{ bytes?: number; url?: string; storageKey?: string }>;
+    referenceAudios: Array<{ url?: string; storageKey?: string }>;
+}): string | null {
+    const { mode, requestConfig, sourceNodeId, nodes, connections, referenceImages, referenceVideos, referenceAudios } = params;
+    const incomingNodeIds = connections.filter((conn) => conn.toNodeId === sourceNodeId).map((conn) => conn.fromNodeId);
+    for (const upId of incomingNodeIds) {
+        const upNode = nodes.find((n) => n.id === upId);
+        if (!upNode) continue;
+        if (upNode.metadata?.status === "loading") {
+            return `上游参考节点「${upNode.title || upNode.id}」仍在生成中，请等待完成后再试`;
+        }
+        if (
+            (upNode.type === CanvasNodeType.Image || upNode.type === CanvasNodeType.Video || upNode.type === CanvasNodeType.Audio) &&
+            !upNode.metadata?.content &&
+            !upNode.metadata?.storageKey
+        ) {
+            return `上游参考节点「${upNode.title || upNode.id}」缺少有效媒体数据，请重新导入或水合后再试`;
+        }
+    }
+
+    if (mode === "video") {
+        const rawSec = Number(requestConfig.videoSeconds || 6);
+        if (!Number.isFinite(rawSec) || rawSec < 4 || rawSec > 30) {
+            return `视频时长参数 (${requestConfig.videoSeconds}) 无效，需在 4~30 秒范围内`;
+        }
+        if (/minimax|hailuo|h3/i.test(requestConfig.model || "") && (rawSec < 4 || rawSec > 15)) {
+            return `MiniMax-H3 视频时长 (${rawSec}s) 超出 4~15 秒整数范围`;
+        }
+        let estimatedBytes = 0;
+        for (const img of referenceImages) {
+            if (img.dataUrl?.startsWith("data:")) {
+                const base64Part = img.dataUrl.split(",")[1] || "";
+                estimatedBytes += Math.floor((base64Part.length * 3) / 4);
+            }
+        }
+        for (const vid of referenceVideos) {
+            if (typeof vid.bytes === "number" && vid.bytes > 0) {
+                estimatedBytes += vid.bytes;
+            } else if (vid.url?.startsWith("data:")) {
+                const base64Part = vid.url.split(",")[1] || "";
+                estimatedBytes += Math.floor((base64Part.length * 3) / 4);
+            }
+        }
+        for (const aud of referenceAudios) {
+            if (aud.url?.startsWith("data:")) {
+                const base64Part = aud.url.split(",")[1] || "";
+                estimatedBytes += Math.floor((base64Part.length * 3) / 4);
+            }
+        }
+        if (estimatedBytes > 8 * 1024 * 1024) {
+            return `多模态参考资产总大小 (${(estimatedBytes / (1024 * 1024)).toFixed(2)} MiB) 超过 8 MiB 上限，请压缩参考资产后再试`;
+        }
+    }
+
+    return null;
 }
 
 export function isAudioFile(file: File) {

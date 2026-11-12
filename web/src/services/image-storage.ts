@@ -223,6 +223,11 @@ export async function setImageBlob(storageKey: string, blob: Blob) {
 }
 
 export async function imageToDataUrl(image: { url?: string; dataUrl?: string; storageKey?: string }, options?: ImageReadOptions) {
+    if (image.dataUrl?.startsWith("data:")) return image.dataUrl;
+    if (image.storageKey) {
+        const stored = await getImageBlob(image.storageKey);
+        if (stored) return blobToDataUrl(stored);
+    }
     const url = image.dataUrl || (await resolveImageUrl(image.storageKey, image.url || ""));
     if (!url || url.startsWith("data:")) return url;
     return blobToDataUrl(await fetchImageBlob(url, options));
